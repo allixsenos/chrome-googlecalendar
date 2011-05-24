@@ -12,5 +12,5 @@
    "name": "GCalendar Checker w/ Popup",
    "permissions": [ "tabs", "bookmarks", "http://*.google.com/", "https://*.google.com/" ],
    "update_url": "http://clients2.google.com/service/update2/crx",
-   "version": "0.3.2"
+   "version": "0.3.3"
 }
