@@ -1,0 +1,427 @@
+<html>
+<head>
+<script>
+
+/**
+ * PHASES
+ * 1) Load next event from server
+ * - refresh every 60 min OR every time you go to calendar OR every time you logout
+ * - drop in a data object
+ * 2) display on screen periodically
+ * - once per minute OR on demand
+ */
+
+// The number of animation frames
+var animationFrames_ = 36;
+
+// Time between each frame
+var animationSpeed_ = 10; // ms
+
+// The canvas width + height
+var canvas_;
+
+// The canvas context element
+var canvasContext_;
+
+var RED = [208, 0, 24, 255];
+var BLUE = [0, 24, 208, 255];
+
+var MSG_NO_TITLE = '(No Title)';
+
+// Time between server polls = 30 minutes
+var POLL_INTERVAL = 30 * 60 * 1000;
+
+// Redraw interval is 1 min
+var DRAW_INTERVAL = 60 * 1000;
+
+// The time when we last polled
+var lastPollTime_ = 0;
+
+// The image dom element.
+var loggedInImage_;
+var rotation_ = 0;
+var loadingAnimation_ = new LoadingAnimation();
+
+// The text in the current badge.
+var currentBadge_ = null;
+
+// Object containing the event
+var nextEvent_ = null;
+
+var DECLINED = 'http://schemas.google.com/g/2005#event.declined';
+
+//////////////////////////////////////////////////////////////////////////////
+// Animation code
+
+// A "loading" animation displayed while we wait for the first response from
+// Calendar. This animates the badge text with a dot that cycles from left to
+// right.
+function LoadingAnimation() {
+  this.timerId_ = 0;
+  this.maxCount_ = 8;  // Total number of states in animation
+  this.current_ = 0;  // Current state
+  this.maxDot_ = 4;  // Max number of dots in animation
+}
+
+LoadingAnimation.prototype.paintFrame = function() {
+  var text = '';
+  for (var i = 0; i < this.maxDot_; i++) {
+    text += (i == this.current_) ? '.' : ' ';
+  }
+  if (this.current_ >= this.maxDot_)
+    text += '';
+
+  chrome.browserAction.setBadgeText({text:text});
+  this.current_++;
+  if (this.current_ == this.maxCount_)
+    this.current_ = 0;
+}
+
+LoadingAnimation.prototype.start = function() {
+  if (this.timerId_)
+    return;
+
+  var self = this;
+  this.timerId_ = window.setInterval(function() {
+    self.paintFrame();
+  }, 100);
+}
+
+LoadingAnimation.prototype.stop = function() {
+  if (!this.timerId_)
+    return;
+
+  window.clearInterval(this.timerId_);
+  this.timerId_ = 0;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// UI CODE
+
+function ease(x) {
+  return (1-Math.sin(Math.PI/2+x*Math.PI))/2;
+}
+
+/** Get the badge text */
+function getBadgeText(nextEvent) {
+  if (!nextEvent) {
+    return '';
+  }
+
+  var ms = nextEvent.startTime.getTime() - now();
+  var nextEventMin = Math.ceil(ms / (1000 * 60));
+
+  var text = '';
+  if (nextEventMin < 60) {
+    text = nextEventMin + 'm';
+  } else if (nextEventMin < 1440) {
+    text = Math.round(nextEventMin/60) + 'h';
+  } else if (nextEventMin < (1440 * 10)) {
+    text = Math.round(nextEventMin/60/24) + 'd';
+  }
+  return text;
+}
+
+/** Draw the event icon */
+function drawFinal() {
+  loadingAnimation_.stop();
+
+  if (!nextEvent_) {
+    showLoggedOut();
+    return;
+  }
+
+  rotation_ = 0;
+  drawIconAtRotation();
+
+  var ms = nextEvent_.startTime.getTime() - now();
+  var nextEventMin = ms / (1000 * 60);
+
+  var bgColor = (nextEventMin < 60) ? RED : BLUE;
+  currentBadge_ = getBadgeText(nextEvent_);
+
+  chrome.browserAction.setBadgeText({text: currentBadge_});
+  chrome.browserAction.setBadgeBackgroundColor({color:bgColor});
+  if (nextEvent_.title) {
+    var text = nextEvent_.title;
+    if (nextEvent_.location) {
+      text += '\n' + nextEvent_.location;
+    }
+    chrome.browserAction.setTitle({ 'title' : text});
+  }
+}
+
+/** Make the icon flip around, and then draw it */
+function animate() {
+  rotation_ += (1/animationFrames_);
+  drawIconAtRotation();
+
+  if (rotation_ <= 1) {
+    setTimeout(animate, animationSpeed_);
+  } else {
+    drawFinal();
+  }
+}
+
+/** Show the user logged out */
+function showLoggedOut() {
+  currentBadge_ = '?';
+  chrome.browserAction.setIcon({path:'icon-16_bw.gif'});
+  chrome.browserAction.setBadgeBackgroundColor({color:[190, 190, 190, 230]});
+  chrome.browserAction.setBadgeText({text:'?'});
+  chrome.browserAction.setTitle({ 'title' : ''});
+}
+
+/** Draw the icon rotated. Demonstrates HTML5. */
+function drawIconAtRotation() {
+  var w = canvas_.width;
+  var h = canvas_.height;
+  canvasContext_.save();
+  canvasContext_.clearRect(0, 0, w, h);
+  canvasContext_.translate(Math.ceil(w/2), Math.ceil(h/2));
+  canvasContext_.rotate(2*Math.PI*ease(rotation_));
+  canvasContext_.drawImage(loggedInImage_, -Math.ceil(w/2), -Math.ceil(h/2));
+  canvasContext_.restore();
+  chrome.browserAction.setIcon(
+      {imageData:canvasContext_.getImageData(0, 0, w, h)});
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Event extraction code
+
+
+/**
+  * @param elem {Object} the XML node to extract the event from
+  * @return {Object} An object containing the event properties.
+  */
+function extractEvent(elem) {
+  var out = {};
+      
+  for (var node = elem.firstChild; node != null; node = node.nextSibling) {
+    if (node.nodeName == 'title') {
+      out.title = node.firstChild ? node.firstChild.nodeValue : MSG_NO_TITLE;
+    } else if (node.nodeName == 'link' && 
+               node.getAttribute('rel') == 'alternate') {
+      out.url = node.getAttribute('href');
+    } else if (node.nodeName == 'gd:where') {
+      out.location = node.getAttribute('valueString');
+    } else if (node.nodeName == 'gd:who') {
+      out.attendeeStatus = node.firstChild.getAttribute('value');
+    } else if (node.nodeName == 'gd:eventStatus') {
+      out.status = node.getAttribute('value');
+    } else if (node.nodeName == 'gd:when') {
+      var startTimeStr = node.getAttribute('startTime');
+      var endTimeStr = node.getAttribute('endTime');
+
+      startTime = rfc3339StringToDate(startTimeStr);
+      endTime = rfc3339StringToDate(endTimeStr);
+
+      if (startTime == null || endTime == null) {
+        continue;
+      }
+
+      out.isAllDay = (startTimeStr.length <= 11);
+      out.startTime = startTime;
+      out.endTime = endTime;
+    }
+  }
+  return out;
+}
+
+var DATE_TIME_REGEX = /^(\d\d\d\d)-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)\.\d+(\+|-)(\d\d):(\d\d)$/;
+var DATE_TIME_REGEX_Z = /^(\d\d\d\d)-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)\.\d+Z$/;
+var DATE_REGEX = /^(\d\d\d\d)-(\d\d)-(\d\d)$/;
+
+/* Convert the incoming date into a javascript date
+ * we accept the following 3 forms:
+ * 2006-04-28T09:00:00.000-07:00
+ * 2006-04-28T09:00:00.000Z
+ * 2006-04-19
+ */
+function rfc3339StringToDate(rfc3339) {
+  var parts = DATE_TIME_REGEX.exec(rfc3339);
+  
+  // Try out the Z version
+  if (!parts) {
+    parts = DATE_TIME_REGEX_Z.exec(rfc3339);
+  }
+  
+  if (parts && parts.length > 0) {
+    var d = new Date();
+    d.setUTCFullYear(parts[1], parseInt(parts[2], 10) - 1, parts[3]);
+    d.setUTCHours(parts[4]);
+    d.setUTCMinutes(parts[5]);
+    d.setUTCSeconds(parts[6]);
+
+    var tzOffsetFeedMin = 0;
+    if (parts.length > 7) {
+      tzOffsetFeedMin = parseInt(parts[8],10) * 60 + parseInt(parts[9],10);
+      if (parts[7] != '-') { // This is supposed to be backwards.
+        tzOffsetFeedMin = -tzOffsetFeedMin;
+      }
+    }
+    return new Date(d.getTime() + tzOffsetFeedMin * 60 * 1000);
+  }
+
+  parts = DATE_REGEX.exec(rfc3339);
+  if (parts && parts.length > 0) {
+    return new Date(parts[1], parseInt(parts[2],10) - 1, parts[3]);
+  }
+  return null;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Chrome related code
+
+// This is used to poll only once per second at most, and delay that if
+// we keep hitting pages that would otherwise force a load.
+var pendingLoadId_ = null;
+
+function onTabUpdated(tabId, changeInfo) {
+  var url = changeInfo.url;
+  if (!url) {
+    return;
+  }
+  if ((url.indexOf('//www.google.com/calendar/') != -1) ||
+      ((url.indexOf('//www.google.com/a/') != -1) && (url.lastIndexOf('/acs') == url.length - 4)) ||
+      (url.indexOf('//www.google.com/accounts/') != -1)) {
+    
+    // The login screen isn't helpful
+    if (url.indexOf('https://www.google.com/accounts/ServiceLogin?') == 0) {
+      return;
+    }
+
+    if (pendingLoadId_) {
+      clearTimeout(pendingLoadId_);
+      pendingLoadId_ = null;
+    }
+      
+    // try to poll in 1 second [which makes the redirects settle down]
+    pendingLoadId_ = setTimeout(pollServer, 1000);
+  }
+}
+
+// Called when the user clicks on the browser action.
+//function onClickAction(tab) {
+//  chrome.tabs.create({url: 'http://www.google.com/calendar/render'});
+//}
+
+// Initialize everything
+function init() {
+  canvas_ = document.getElementById('canvas');
+  loggedInImage_ = document.getElementById('logged_in');
+  canvasContext_ = canvas_.getContext('2d');
+
+  chrome.browserAction.setIcon({path: 'icon-16.gif'});
+  loadingAnimation_.start();
+  pollServer();
+  window.setInterval(redraw, DRAW_INTERVAL);
+
+  chrome.tabs.onUpdated.addListener(onTabUpdated);
+  //chrome.browserAction.onClicked.addListener(onClickAction);
+}
+
+// Fire this once per minute.
+function redraw() {
+  console.log('redraw()');
+  
+  // If the next event just passed, re-poll.
+  if (nextEvent_) {
+    var t = nextEvent_.startTime.getTime() - now();
+    if ((-60*1000 <= t) && (t <= 0)) {
+      pollServer();
+      return;
+    }
+  }
+
+  considerDrawing();
+
+  // if ((we are logged in) && (30 minutes have passed)) re-poll
+  if (nextEvent_ && (now() - lastPollTime_ >= POLL_INTERVAL)) {
+    console.log('redraw - pollServer');
+    pollServer();
+  }
+}
+
+function now() {
+  return (new Date()).getTime();
+}
+
+function genResponseChangeFunc(xhr) {
+  return function() {
+    if (xhr.readyState != 4) {
+      return;
+    }
+    if (!xhr.responseXML) {
+      console.log('No responseXML');
+      nextEvent_ = null;
+      drawFinal();
+      return;
+    }
+
+    var elem = xhr.responseXML.getElementsByTagName('entry');
+    if (elem && elem.length > 0) {
+      for(var i = 0; i < elem.length; ++i) {
+        var e = extractEvent(elem[i]);
+
+        // Get the time from then to now
+        var t = e.startTime.getTime() - now();
+        if (t >= 0 && (e.attendeeStatus != DECLINED)) {
+          nextEvent_ = e;
+          considerDrawing()
+          return;
+        }
+      }
+    }
+
+    console.error('Error: feed retrieved, but no event found');
+    nextEvent_ = null;
+    drawFinal();
+  }
+}
+
+// Three draw functions
+// 1) considerDrawing = redraw onscreen ONLY if something changed
+// 2) animate = draws + rotates
+// 3) drawFinal = draw it when it settles down.
+
+function considerDrawing() {
+  var text = getBadgeText(nextEvent_);
+  if (currentBadge_ != text) {
+    console.log('redraw - animate');
+    animate();
+  }
+}
+
+function pollServer() {
+  pendingLoadId_ = null;
+  
+  lastPollTime_ = now();
+  var xhr = new XMLHttpRequest();
+  try {
+    xhr.onreadystatechange = genResponseChangeFunc(xhr);
+    xhr.onerror = function(error) {
+      console.log('error: ' + error);
+      nextEvent_ = null;
+      drawFinal();
+    }
+    var url = 'https://www.google.com/calendar/feeds/default/private/embed' + 
+      '?toolbar=true&max-results=10';
+
+    xhr.open('GET', url);
+    xhr.send(null);
+  } catch(e) {
+    console.log('ex: ' + e);
+    nextEvent_ = null;
+    drawFinal();
+  }
+}
+
+</script>
+</head>
+<body onload="init()">
+<img id="logged_in" src="icon-16.gif">
+
+<canvas id="canvas" width="19" height="19">
+</body>
+</html>
